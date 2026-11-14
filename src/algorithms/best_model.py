@@ -408,7 +408,7 @@ class Desk:
             return
         opening = action["schedule"][0]["feeCents"]
         ratio = fee / opening if opening > 0 else 1.0
-        step = 0.985 if ratio <= 1.001 else 1.02 if ratio >= 1.3 else 1.0
+        step = 0.97 if ratio <= 1.001 else 1.02 if ratio >= 1.3 else 1.0
         self.fee_mult = min(FEE_MAX, max(FEE_MIN, self.fee_mult * step))
 
     # --- Quotes ---

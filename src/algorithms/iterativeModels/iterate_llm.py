@@ -10,12 +10,15 @@ team's normal API quota and are created by the dispatcher.
 from __future__ import annotations
 
 import argparse
+import codecs
 from collections import Counter
 import difflib
 import importlib.util
 import json
 import os
 import re
+import selectors
+import signal
 import shutil
 import subprocess
 import sys
@@ -30,6 +33,7 @@ DISPATCH = ROOT / "src" / "algorithms" / "best_model.py"
 DISPATCH_NAME = DISPATCH.name
 DISPATCH_RELATIVE = DISPATCH.relative_to(ROOT).as_posix()
 RULES = ROOT / "docs" / "RULES.md"
+RULES_RELATIVE = RULES.relative_to(ROOT).as_posix()
 SCORE_RE = re.compile(
     r"End\s+margin €\s*([\d,.-]+)\s+revenue €\s*([\d,.-]+)\s+\d+ orders\s+(\d+(?:\.\d+)?)% on time"
 )
@@ -95,14 +99,147 @@ def print_run_summary(label: str, score: tuple[int, int, float], runs: list[dict
     )
 
 
-def print_seed_result(label: str, seed: str, margin_cents: int, revenue_cents: int, on_time: float, ranked: bool) -> None:
+def print_seed_result(
+    label: str,
+    seed: str,
+    margin_cents: int,
+    revenue_cents: int,
+    on_time: float,
+    ranked: bool,
+    comparison: Optional[dict[str, Any]] = None,
+    comparison_label: str = "current best",
+) -> None:
     margin_rate = margin_cents / revenue_cents if revenue_cents else 0.0
+    if comparison is not None:
+        profit_delta = (margin_cents - comparison["margin_cents"]) / 100
+        profit_change = f"+€{profit_delta:,.2f}" if profit_delta >= 0 else f"-€{abs(profit_delta):,.2f}"
+        margin_delta_pp = (margin_rate - comparison["margin_share"]) * 100
+        on_time_delta_pp = (on_time - comparison["on_time"]) * 100
+        comparison_text = (
+            f" | profit vs {comparison_label} €{comparison['margin_cents'] / 100:,.2f} ({profit_change})"
+            f" | margin {margin_rate:.1%} ({margin_delta_pp:+.1f} pp)"
+            f" | on-time {on_time:.1%} ({on_time_delta_pp:+.1f} pp)"
+        )
+    else:
+        comparison_text = f" | margin rate {margin_rate:.1%} | on-time deliveries {on_time:.1%}"
     print(
-        f"{label} seed {seed}: net profit €{margin_cents / 100:,.2f} | "
-        f"margin rate {margin_rate:.1%} | on-time deliveries {on_time:.1%} | "
+        f"{label} seed {seed}: net profit €{margin_cents / 100:,.2f}"
+        f"{comparison_text} | "
         f"{'ranked' if ranked else 'not ranked'}",
         flush=True,
     )
+
+
+def prompt_run_notes(runs: list[dict[str, Any]]) -> str:
+    """Keep useful result evidence for Codex without embedding full diagnostics."""
+    notes = []
+    for run in runs:
+        diagnostics = run.get("diagnostics", {})
+        event_counts = diagnostics.get("eventCounts", {})
+        ledger = diagnostics.get("ledgerCentsByKind", {})
+        losses = sorted(
+            ((kind, cents) for kind, cents in ledger.items() if cents < 0),
+            key=lambda item: item[1],
+        )[:4]
+        failures = Counter(
+            item.get("reason", "unknown") for item in diagnostics.get("visitFailures", [])
+        )
+        notes.append({
+            "seed": run["seed"],
+            "net_profit_eur": round(run["margin_cents"] / 100, 2),
+            "margin_rate_pct": round(run["margin_share"] * 100, 1),
+            "on_time_pct": round(run["on_time"] * 100, 1),
+            "ranked": run["ranked"],
+            "requests": diagnostics.get("requestOutcomes", {}),
+            "major_losses_cents": dict(losses),
+            "visit_failures": dict(failures),
+            "late_or_undelivered_count": len(diagnostics.get("lateOrUndeliveredOrders", [])),
+            "deadline_warnings": event_counts.get("deadline_close", 0),
+            "gig_expirations": event_counts.get("gig_expired", 0),
+            "bookings": diagnostics.get("bookings", {}).get("count", 0),
+        })
+    return json.dumps(notes, ensure_ascii=False, separators=(",", ":"))
+
+
+def run_with_live_output(command: list[str], timeout: float, label: str, seed: str, level: int) -> subprocess.CompletedProcess:
+    """Run a dispatcher while showing its flushed daily reports as they arrive."""
+    print(f"{label}: starting seed {seed} (level {level}; timeout {timeout:g}s)", flush=True)
+    process = subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=0)
+    assert process.stdout is not None
+    selector = selectors.DefaultSelector()
+    selector.register(process.stdout, selectors.EVENT_READ)
+    decoder = codecs.getincrementaldecoder("utf-8")("replace")
+    output_parts: list[str] = []
+    pending = ""
+    deadline = time.monotonic() + timeout
+    timed_out = False
+
+    def drain_ready() -> None:
+        nonlocal pending
+        while process.poll() is None or selector.get_map():
+            events = selector.select(timeout=0.2)
+            if not events:
+                return
+            for key, _ in events:
+                data = os.read(key.fd, 4096)
+                if not data:
+                    selector.unregister(key.fileobj)
+                    continue
+                chunk = decoder.decode(data)
+                output_parts.append(chunk)
+                pending += chunk
+                while "\n" in pending:
+                    line, pending = pending.split("\n", 1)
+                    print(f"[{label} {seed}] {line}", flush=True)
+
+    try:
+        while process.poll() is None:
+            if time.monotonic() >= deadline:
+                timed_out = True
+                process.send_signal(signal.SIGINT)
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                break
+            events = selector.select(timeout=min(0.2, max(0.0, deadline - time.monotonic())))
+            for key, _ in events:
+                data = os.read(key.fd, 4096)
+                if not data:
+                    selector.unregister(key.fileobj)
+                    continue
+                chunk = decoder.decode(data)
+                output_parts.append(chunk)
+                pending += chunk
+                while "\n" in pending:
+                    line, pending = pending.split("\n", 1)
+                    print(f"[{label} {seed}] {line}", flush=True)
+        drain_ready()
+    except KeyboardInterrupt:
+        if process.poll() is None:
+            process.send_signal(signal.SIGINT)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+        drain_ready()
+        raise
+    finally:
+        selector.close()
+        process.stdout.close()
+
+    final_chunk = decoder.decode(b"", final=True)
+    if final_chunk:
+        output_parts.append(final_chunk)
+        pending += final_chunk
+    if pending:
+        print(f"[{label} {seed}] {pending}", flush=True)
+    output = "".join(output_parts)
+    if timed_out:
+        raise subprocess.TimeoutExpired(command, timeout, output=output)
+    return subprocess.CompletedProcess(command, process.returncode, stdout=output, stderr="")
 
 
 def collect_diagnostics(world_id: str, server_retries: int, retry_delay: float) -> dict[str, Any]:
@@ -202,75 +339,71 @@ def collect_diagnostics(world_id: str, server_retries: int, retry_delay: float) 
 
 
 def request_patch(
-    source: str,
     history: str,
     model: Optional[str],
+    reasoning_effort: Optional[str],
     feedback: str = "",
     server_retries: int = 0,
     retry_delay: float = 5.0,
 ) -> str:
-    rules = RULES.read_text(encoding="utf-8")
-    # Send the game rules and the full strategy so the model can reason from the contract.
-    prompt = f"""    Improve this Spread dispatcher using the measured results and game rules below.
-    Return ONLY a unified diff that changes {DISPATCH_RELATIVE}. Keep changes focused;
-preserve API correctness and the 90% on-time ranking minimum. Do not add dependencies.
-    The patch must use standard diff headers (--- a/{DISPATCH_RELATIVE} / +++ b/{DISPATCH_RELATIVE}).
-You MUST propose a concrete source-code improvement. Do not return an empty or no-op diff.
-Prefer an evidence-based change over speculative rewrites. The caller tests each patch
-on the same deterministic practice seeds and retains it only when its score tuple improves:
-ranked seed count first, then total margin, then average on-time share.
-
-PREVIOUS PATCH ISSUE (if any):
-{feedback or "None; this is the first attempt for this iteration."}
-
-MEASURED RUNS:
-{history}
-
-GAME RULES:
-{rules}
-
-CURRENT {DISPATCH_RELATIVE}:
-```python
-{source}
-```
-"""
-    print("\n========== PROMPT SENT TO CODEX: START ==========\n", flush=True)
-    print(prompt, flush=True)
-    print("\n========== PROMPT SENT TO CODEX: END ==========\n", flush=True)
     codex = shutil.which("codex")
     if not codex:
         raise RuntimeError("Codex CLI was not found on PATH. Install it and sign in with `codex login`.")
-    with tempfile.TemporaryDirectory(prefix="spread-codex-llm-") as temp:
-        output = Path(temp) / "answer.txt"
-        command = [codex, "exec", "--ephemeral", "--sandbox", "read-only",
-                   "--output-last-message", str(output)]
-        if model:
-            command += ["--model", model]
-        command.append("-")  # read the prompt on stdin
-        # Prevent an API key or custom API endpoint in the shell environment from
-        # overriding Codex's ChatGPT sign-in and charging the API account.
-        child_env = os.environ.copy()
-        child_env.pop("OPENAI_API_KEY", None)
-        child_env.pop("OPENAI_BASE_URL", None)
-        for attempt in range(server_retries + 1):
-            try:
-                result = subprocess.run(command, input=prompt, text=True, capture_output=True,
-                                        cwd=ROOT, env=child_env, timeout=600)
-            except subprocess.TimeoutExpired as error:
-                if attempt == server_retries:
-                    raise RuntimeError("Codex CLI request timed out after 10 minutes") from error
-                wait_before_retry("Codex CLI request", attempt + 1, retry_delay)
-                continue
-            if result.returncode:
-                detail = result.stderr.strip() or result.stdout.strip() or "no error details"
-                if is_transient_server_error(RuntimeError(detail), detail) and attempt < server_retries:
+    context = {
+        "goal": "Improve dispatcher performance while preserving API correctness and the 90% on-time ranking minimum.",
+        "score_priority": ["ranked seed count", "total net margin", "average on-time share"],
+        "change_scope": "Make a substantive focused improvement; several related lines are welcome. Prefer a measurable gain over a minimal diff.",
+        "rules": RULES_RELATIVE,
+        "patch_feedback": feedback or "First attempt; no prior patch issue.",
+        "measured_runs": history,
+    }
+    # Put evidence in a temporary repository file so the actual instruction stays short.
+    with tempfile.TemporaryDirectory(prefix=".it-", dir=ROOT) as context_dir:
+        context_file = Path(context_dir) / "c.json"
+        context_file.write_text(json.dumps(context, ensure_ascii=False), encoding="utf-8")
+        context_relative = context_file.relative_to(ROOT).as_posix()
+        prompt = (
+            f"Improve {DISPATCH_NAME} using {context_relative}; read {RULES_RELATIVE}. "
+            f"Make a substantive focused multi-line change. Return only a unified diff for {DISPATCH_RELATIVE} "
+            "(a/b headers; no fences, markers, or prose)."
+        )
+        if len(prompt) > 250:
+            raise RuntimeError(f"Codex prompt is {len(prompt)} characters; limit is 250")
+        print("\n========== CODEX PROMPT (<=250 CHARACTERS) ==========\n", flush=True)
+        print(f"{prompt}\nPrompt length: {len(prompt)} characters", flush=True)
+        with tempfile.TemporaryDirectory(prefix="spread-codex-llm-") as temp:
+            output = Path(temp) / "answer.txt"
+            command = [codex, "exec", "--ephemeral", "--sandbox", "read-only",
+                       "--output-last-message", str(output)]
+            if model:
+                command += ["--model", model]
+            if reasoning_effort:
+                command += ["--config", f"model_reasoning_effort={reasoning_effort}"]
+            command.append("-")  # read the prompt on stdin
+            # Prevent an API key or custom API endpoint in the shell environment from
+            # overriding Codex's ChatGPT sign-in and charging the API account.
+            child_env = os.environ.copy()
+            child_env.pop("OPENAI_API_KEY", None)
+            child_env.pop("OPENAI_BASE_URL", None)
+            for attempt in range(server_retries + 1):
+                try:
+                    result = subprocess.run(command, input=prompt, text=True, capture_output=True,
+                                            cwd=ROOT, env=child_env, timeout=600)
+                except subprocess.TimeoutExpired as error:
+                    if attempt == server_retries:
+                        raise RuntimeError("Codex CLI request timed out after 10 minutes") from error
                     wait_before_retry("Codex CLI request", attempt + 1, retry_delay)
                     continue
-                raise RuntimeError(f"Codex CLI failed (exit {result.returncode}): {detail[-3000:]}")
-            break
-        if not output.exists():
-            raise RuntimeError("Codex CLI completed without writing its final response")
-        return output.read_text(encoding="utf-8")
+                if result.returncode:
+                    detail = result.stderr.strip() or result.stdout.strip() or "no error details"
+                    if is_transient_server_error(RuntimeError(detail), detail) and attempt < server_retries:
+                        wait_before_retry("Codex CLI request", attempt + 1, retry_delay)
+                        continue
+                    raise RuntimeError(f"Codex CLI failed (exit {result.returncode}): {detail[-3000:]}")
+                break
+            if not output.exists():
+                raise RuntimeError("Codex CLI completed without writing its final response")
+            return output.read_text(encoding="utf-8")
 
 
 def extract_diff(response: str) -> str:
@@ -316,8 +449,11 @@ def evaluate(
     retry_delay: float,
     evaluation_timeout: float,
     label: str,
+    comparison_runs: Optional[list[dict[str, Any]]] = None,
+    comparison_label: str = "current best",
 ) -> tuple[tuple[int, int, float], list[dict[str, Any]]]:
     runs: list[dict[str, Any]] = []
+    comparison_by_seed = {run["seed"]: run for run in comparison_runs or []}
     with tempfile.TemporaryDirectory(prefix="spread-eval-") as temp:
         candidate = Path(temp) / "dispatch.py"
         candidate.write_text(source, encoding="utf-8")
@@ -325,9 +461,7 @@ def evaluate(
             command = [sys.executable, str(candidate), "--level", str(level), "--seed", seed]
             for attempt in range(server_retries + 1):
                 try:
-                    result = subprocess.run(
-                        command, cwd=ROOT, text=True, capture_output=True, timeout=evaluation_timeout
-                    )
+                    result = run_with_live_output(command, evaluation_timeout, label, seed, level)
                 except subprocess.TimeoutExpired as error:
                     if attempt == server_retries:
                         raise RuntimeError(f"Evaluation timed out for seed {seed!r}") from error
@@ -350,7 +484,10 @@ def evaluate(
             margin_cents = round(float(match.group(1).replace(",", "")) * 100)
             revenue_cents = round(float(match.group(2).replace(",", "")) * 100)
             on_time = float(match.group(3)) / 100
-            print_seed_result(label, seed, margin_cents, revenue_cents, on_time, ranked)
+            print_seed_result(
+                label, seed, margin_cents, revenue_cents, on_time, ranked,
+                comparison_by_seed.get(seed), comparison_label,
+            )
             try:
                 diagnostics = collect_diagnostics(world_match.group(1), server_retries, retry_delay)
             except Exception as error:
@@ -388,6 +525,10 @@ def main() -> int:
     parser.add_argument("--retry-delay", type=float, default=5.0, help="initial delay between server retries in seconds (default: 5)")
     parser.add_argument("--evaluation-timeout", type=float, default=600.0, help="maximum seconds for one simulated world (default: 600)")
     parser.add_argument("--model", help="Codex model override; defaults to the model configured in Codex CLI")
+    parser.add_argument(
+        "--reasoning-effort", choices=("low", "medium", "high", "xhigh", "max"),
+        help="Codex reasoning effort override; omit to use the Codex CLI configuration",
+    )
     args = parser.parse_args()
     if importlib.util.find_spec("spread") is None:
         parser.error(
@@ -424,12 +565,13 @@ def main() -> int:
             best_source, holdout_seeds, args.level, args.server_retries, args.retry_delay,
             args.evaluation_timeout, "Baseline holdout",
         )
+        best_holdout_runs = baseline_holdout_runs
     else:
-        best_holdout_score, baseline_holdout_runs = None, []
+        best_holdout_score, baseline_holdout_runs, best_holdout_runs = None, [], []
     print_run_summary("Baseline training results", best_score, best_runs)
     if holdout_seeds:
         print_run_summary("Baseline holdout results", best_holdout_score, baseline_holdout_runs)
-    history = [f"Baseline training score {best_score}; detailed diagnostics: {json.dumps(best_runs, ensure_ascii=False)}"]
+    history = [f"Baseline training: {prompt_run_notes(best_runs)}"]
     fatal_codex_error = False
     for iteration in range(1, args.iterations + 1):
         feedback = ""
@@ -438,7 +580,7 @@ def main() -> int:
                   f"{f' ({args.model})' if args.model else ''}", flush=True)
             try:
                 response = request_patch(
-                    best_source, "\n\n".join(history[-5:]), args.model, feedback,
+                    "\n\n".join(history[-5:]), args.model, args.reasoning_effort, feedback,
                     args.server_retries, args.retry_delay,
                 )
                 candidate = apply_candidate(best_source, extract_diff(response))
@@ -456,7 +598,7 @@ def main() -> int:
 
             score, runs = evaluate(
                 candidate, seeds, args.level, args.server_retries, args.retry_delay,
-                args.evaluation_timeout, f"Candidate {iteration}",
+                args.evaluation_timeout, f"Candidate {iteration}", best_runs,
             )
             added, removed = changed_rows(best_source, candidate)
             print_run_summary(f"Candidate training results (iteration {iteration})", score, runs)
@@ -466,13 +608,13 @@ def main() -> int:
                     f"File changed: No (candidate rejected). Candidate code delta: +{added}/-{removed} rows; saved delta: +0/-0.",
                     flush=True,
                 )
-                history.append(f"Iteration {iteration}: rejected training candidate {score}; diagnostics: {json.dumps(runs, ensure_ascii=False)}")
+                history.append(f"Iteration {iteration}: candidate rejected; results: {prompt_run_notes(runs)}")
                 break
 
             if holdout_seeds:
                 holdout_score, holdout_runs = evaluate(
                     candidate, holdout_seeds, args.level, args.server_retries, args.retry_delay,
-                    args.evaluation_timeout, f"Candidate {iteration} holdout",
+                    args.evaluation_timeout, f"Candidate {iteration} holdout", best_holdout_runs,
                 )
             else:
                 holdout_score, holdout_runs = None, []
@@ -484,20 +626,21 @@ def main() -> int:
                 best_source, best_score, best_runs = candidate, score, runs
                 if holdout_seeds:
                     best_holdout_score = holdout_score
+                    best_holdout_runs = holdout_runs
                 DISPATCH.write_text(best_source, encoding="utf-8")
                 print(
                     f"File changed: Yes; saved to {DISPATCH}. Code delta: +{added}/-{removed} rows.",
                     flush=True,
                 )
                 holdout_note = "passed; score details withheld from Codex" if holdout_seeds else "disabled"
-                history.append(f"Iteration {iteration}: accepted training score {score}; diagnostics: {json.dumps(runs, ensure_ascii=False)}; holdout={holdout_note}")
+                history.append(f"Iteration {iteration}: accepted training candidate; results: {prompt_run_notes(runs)}; holdout={holdout_note}")
             else:
                 feedback = "The patch improved training but regressed on the separate holdout seeds. Try a more general change."
                 print(
                     f"File changed: No (holdout regressed). Candidate code delta: +{added}/-{removed} rows; saved delta: +0/-0.",
                     flush=True,
                 )
-                history.append(f"Iteration {iteration}: rejected by holdout; training score {score}; holdout details withheld; training diagnostics: {json.dumps(runs, ensure_ascii=False)}")
+                history.append(f"Iteration {iteration}: rejected by holdout; training results: {prompt_run_notes(runs)}; holdout details withheld")
             break
         if fatal_codex_error:
             break
