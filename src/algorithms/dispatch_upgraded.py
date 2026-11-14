@@ -65,8 +65,9 @@ WAKE_ON: list[DeskEventKind] = ["price_request", "order_won", "order_changed", "
 # cost * OPTION_COST. The competitor is about 10% either way of the list at levels up to 6, 12-38% above it at level 7, 26-54%
 # above at level 8. MARKUP is only where the market starts: Market then learns the level from the dealers' answers.
 MARKUP = {1: 1.0, 2: 1.0, 3: 1.0, 4: 1.0, 5: 1.0, 6: 1.03, 7: 1.10, 8: 1.18}
-OPTION_FACTOR = {"same_day": 1.10, "next_day": 1.0, "within_3_days": 0.97}  # more time is cheaper to serve
-OPTION_COST = {"same_day": 1.15, "next_day": 1.0, "within_3_days": 0.95}  # and a car that must go now needs a driver now
+# Reserve more margin for urgent work and compete more strongly when the dealer gives us time.
+OPTION_FACTOR = {"same_day": 1.18, "next_day": 1.04, "within_3_days": 0.92}
+OPTION_COST = {"same_day": 1.22, "next_day": 1.02, "within_3_days": 0.90}
 LEARN_TARGET = {4: 0.55, 5: 0.55, 6: 0.50, 7: 0.40, 8: 0.35}  # the share of clean quotes to win; fewer where drivers are few
 LEARN_STEP = 0.03  # the size of one lesson, in log units: a win teaches (1 - target) of it, a loss target of it
 LEARN_CLEAN = 1.04  # a quote teaches only when it was at most 4% over the market level, trust apart

@@ -16,12 +16,31 @@ What changed from the starter, and why (every change answers something the handb
     am/pm, hours in words, "half three", a correction counts, a denied time does not. It also reads
     manual gearboxes and missing plates, so those gigs go out right the first time.
 
+Added in this version (each answers a sentence of RULES.md or HANDBOOK.md):
+
+ 7. It learns the price level the dealers accept (HANDBOOK, "Dealers compare prices": "a system that keeps learning from
+    its own wins and losses keeps its margin"). `Market` moves a multiple of the list price up after a win and down
+    after a loss, in the ratio that makes LEARN_TARGET of the clean quotes win. A small deviation for each pickup place
+    that fades in a day catches the outage (a backup 30% dearer) and the price war (20% cheaper) without a script.
+    Only a quote that was priced at the market level teaches: a loss at a price that was high on purpose says nothing.
+ 8. Dealer trust (level 8): each on-time order raises the price a dealer accepts by 1%, up to 25; a late order halves the
+    count. The desk counts it from the ledger, as RULES.md says, and quotes that much higher to that dealer.
+ 9. A guard for the delivery minimum. Being under 90% on time means no rank at all, and a quote that loses costs nothing.
+    When the late share, plus the orders at risk, climbs near the limit, same-day and risky requests are declined first.
+10. The cost estimate follows the rules' list of what a driver dislikes: private addresses, evenings, Saturdays,
+    trade-ins and charging stops (the typical fee is the drive and the trips only). A same-day option costs more to
+    serve than a three-day one. A bulk order is judged against the drivers who live near its yard.
+11. Cars that sit in the app without a driver raise the price of new work (the shortage shows there first, before the
+    first deadline warning). Gig fees follow the scarcity of drivers around the pickup, and the fee cap lifts for
+    an order inside its warning and more for one that is late, because an undelivered car costs twice its price.
+
 All the numbers in the TUNING block are educated guesses, not measurements. Run the same seeds before and
 after you change one, and look at the margin AND the on-time share. To run it: python dispatch.py --level 8
 """
 from __future__ import annotations
 
 import argparse
+import math
 import re
 import sys
 import time
@@ -42,10 +61,30 @@ WAKE_ON: list[DeskEventKind] = ["price_request", "order_won", "order_changed", "
                                 "gig_dropped", "no_show"]
 
 # --- TUNING: guesses, to be swept with --seed ---------------------------------------------------------------------------
-# The quote is: list price * MARKUP * OPTION_FACTOR, but never under the estimated cost * MARGIN.
-# The competitor is about 10% either way of the list at levels up to 6, 12-38% above it at level 7, 26-54% above at level 8.
+# The quote is: list price * what the market teaches * trust * OPTION_FACTOR * what trouble adds, but never under the estimated
+# cost * OPTION_COST. The competitor is about 10% either way of the list at levels up to 6, 12-38% above it at level 7, 26-54%
+# above at level 8. MARKUP is only where the market starts: Market then learns the level from the dealers' answers.
 MARKUP = {1: 1.0, 2: 1.0, 3: 1.0, 4: 1.0, 5: 1.0, 6: 1.03, 7: 1.10, 8: 1.18}
 OPTION_FACTOR = {"same_day": 1.10, "next_day": 1.0, "within_3_days": 0.97}  # more time is cheaper to serve
+OPTION_COST = {"same_day": 1.15, "next_day": 1.0, "within_3_days": 0.95}  # and a car that must go now needs a driver now
+LEARN_TARGET = {4: 0.55, 5: 0.55, 6: 0.50, 7: 0.40, 8: 0.35}  # the share of clean quotes to win; fewer where drivers are few
+LEARN_STEP = 0.03  # the size of one lesson, in log units: a win teaches (1 - target) of it, a loss target of it
+LEARN_CLEAN = 1.04  # a quote teaches only when it was at most 4% over the market level, trust apart
+LEARN_SHARE = 0.5  # the part of a lesson that goes to the whole market; the rest goes to the pickup place
+LEVEL_LIMITS = (0.80, 2.0)  # the market level, as a multiple of the list price
+PLACE_LIMITS, PLACE_HALF_LIFE = (-0.35, 0.45), 24 * HOUR  # a place's deviation: an outage or a price war lasts one day
+TRUST_STEP, TRUST_MAX = 0.01, 25  # RULES.md, dealer trust at level 8
+GUARD_SOFT, GUARD_HARD = 0.05, 0.075  # at-risk share of the orders won: decline same-day and risky work, then nearly all new work
+GUARD_SCARCITY, GUARD_SCARCITY_HARD, GUARD_RISK = 1.35, 1.15, 1.15
+DECLINE_MULT = 6.0  # a declining quote: this many times the list price, far above any dealer's limit
+EXTRA_PRIVATE, EXTRA_EVENING, EXTRA_WEEKEND, EXTRA_TRADE_IN, EXTRA_CHARGING = 0.08, 0.10, 0.20, 0.04, 0.05  # what drivers dislike
+EVENING_FROM = 17 * HOUR  # a pickup from this hour on is evening work
+STALE_AFTER = 90  # minutes in the app without a booking before an order counts as stale
+BACKLOG_FREE, BACKLOG_SLOPE, BACKLOG_CAP = 0.06, 0.02, 0.5  # stale orders above 6% of the drivers raise the price 2% each, up to 50%
+BULK_FREE_MIN, BULK_FREE_MAX, BULK_SUPPLY_SHARE = 4, 12, 0.5  # cars from one yard that cost no extra: half the drivers near it
+BULK_SLOPE, BULK_CAP = 0.04, 1.0
+FEE_SCARCITY = 0.4  # a gig's fees rise by this share of the pickup's scarcity premium
+CAP_URGENT, CAP_LATE = 1.9, 2.2  # the fee cap, as a share of the price: inside the warning; late (an undelivered car costs 2x the price)
 EXPECTED_FEE = {1: 1.1, 2: 1.1, 3: 1.1, 4: 1.1, 5: 1.1, 6: 1.15, 7: 1.4, 8: 1.5}  # fees paid, as a multiple of the typical fee
 MARGIN = 1.08
 REACH_MINUTES = 75  # a driver at home counts as near a place when the road takes at most this long
@@ -66,6 +105,41 @@ class Retry(NamedTuple):
     pickup_from: int = 0
     manual_licence: bool = False
     plates: bool = False
+
+
+class Quoted(NamedTuple):
+    """What the desk sent for a request: what each option would have cost at the market level, and the price that went out."""
+    place: str
+    trust: float
+    units: dict
+    prices: dict
+
+
+class Market:
+    """What the dealers' answers teach about the price they accept, as a multiple of the list price.
+
+    `level` holds for the whole market. `shift` is a deviation for each pickup place, in log units, that fades with
+    PLACE_HALF_LIFE: an outage or a price war lasts a day, while the lanes of a place last the week. A win teaches that
+    the price may rise and a loss that it may fall. The lessons are in the ratio (1 - target) : target, so the share of
+    the clean quotes that win settles at `target`. The caller teaches only with quotes that were priced at the level."""
+
+    def __init__(self, prior: float, target: float):
+        self.prior, self.level = prior, prior
+        self.up, self.down = (1 - target) * LEARN_STEP, target * LEARN_STEP
+        self.shift: dict[str, tuple[float, int]] = {}  # place -> (deviation, the minute it was set)
+
+    def deviation(self, place: str, now: int) -> float:
+        value, at = self.shift.get(place, (0.0, now))
+        return value * 0.5 ** (max(0, now - at) / PLACE_HALF_LIFE)
+
+    def multiple(self, place: str, now: int) -> float:
+        return self.level * math.exp(self.deviation(place, now))
+
+    def learn(self, place: str, now: int, won: bool) -> None:
+        lesson = self.up if won else -self.down
+        self.level = min(LEVEL_LIMITS[1], max(LEVEL_LIMITS[0], self.level * math.exp(lesson * LEARN_SHARE)))
+        value = self.deviation(place, now) + lesson * (1 - LEARN_SHARE)
+        self.shift[place] = (min(PLACE_LIMITS[1], max(PLACE_LIMITS[0], value)), now)
 
 
 # --- Where the drivers live ------------------------------------------------------------------------------------------------
@@ -162,6 +236,14 @@ class Desk:
         self.pressure, self.pressure_at = 0.0, now  # trouble, fading with time
         self.offered: dict[str, set[str]] = {}  # gig id -> the drivers who got an offer for it
         self.offers_by_day: Counter = Counter()  # (driver id, day) -> offers sent: at most three
+        self.market = Market(MARKUP[level], LEARN_TARGET.get(level, 0.5))  # the price level that the dealers accept
+        self.drafts: dict[str, Quoted] = {}  # request id -> the quote in the outbox, until the world accepts it
+        self.quoted: dict[str, Quoted] = {}  # request id -> the quote that the world accepted, until the dealer decides
+        self.trust: Counter = Counter()  # dealer id -> its count of your on-time orders (level 8)
+        self.counted: set[str] = set()  # the orders counted on time
+        self.refunded: set[str] = set()  # the orders that had a late refund
+        self.first_posted: dict[str, int] = {}  # order id -> the minute its first gig reached the app
+        self.batch_wins: Counter = Counter()  # batch id -> the orders won from that dealer group
 
     # --- Starting again ---
 
@@ -181,6 +263,13 @@ class Desk:
         for request in self.requests.values():
             if request["batchId"]:
                 self.batches[request["batchId"]] += 1
+        for event in history:
+            if event["kind"] == "ledger":
+                self.trust_line(event["line"])
+            elif event["kind"] == "order_won" and event["order"]["id"] in self.requests:
+                batch = self.requests[event["order"]["id"]]["batchId"]
+                if batch:
+                    self.batch_wins[batch] += 1
         self.orders = {o["id"]: o for o in snapshot["orders"] if o["id"] in self.requests and o["status"] != "cancelled"}
         for order in self.orders.values():
             if order["status"] == "waiting" and not self.gigs_of(order["id"]):
@@ -204,6 +293,8 @@ class Desk:
             self.quote(event["request"])
         elif kind == "order_won":
             self.win(event["order"])
+        elif kind == "order_lost":  # the dealer took the competitor's price: ours was above what it accepts today
+            self.learn_outcome(event["requestId"], False, None)
         elif kind == "order_changed":
             self.change(event["order"])
         elif kind == "order_cancelled":  # the world has stopped the car and told each of its gigs what happens
@@ -230,6 +321,7 @@ class Desk:
             self.delivered(event["orderId"], event["leg"], event["at"])
         elif kind == "ledger":
             line = event["line"]
+            self.trust_line(line)
             if line["kind"] == "late_refund" and line["orderId"] and line["orderId"] not in self.late:
                 self.late.add(line["orderId"])
                 self.worry(2.0)
@@ -255,13 +347,59 @@ class Desk:
         overdue = sum(1 for o in self.orders.values() if o["id"] not in self.late and o["deadline"] < self.now and undelivered(o))
         return (late + overdue) / (len(self.orders) + 20)  # 20 orders on time as a prior: one late order in the first hour is not 100% late
 
-    def markup(self) -> float:
+    def pressure_factor(self) -> float:
+        """What trouble, load and cars without a driver add to a price: 1.0 when all is well. The market level is not in it."""
         trouble = self.strain() + LATE_WEIGHT * max(0.0, self.late_share() - LATE_FREE)
         factor = min(PRESSURE_CAP, 1 + PRESSURE_SLOPE * trouble)
         if self.supply.drivers:
+            drivers = len(self.supply.drivers)
             active = sum(1 for o in self.orders.values() if undelivered(o))
-            factor *= 1 + LOAD_SLOPE * max(0.0, active / len(self.supply.drivers) - LOAD_FREE)
-        return MARKUP[self.level] * factor
+            factor *= 1 + LOAD_SLOPE * max(0.0, active / drivers - LOAD_FREE)
+            stale = self.stale_orders()
+            factor *= 1 + min(BACKLOG_CAP, BACKLOG_SLOPE * max(0.0, stale - max(2.0, BACKLOG_FREE * drivers)))
+        return factor
+
+    def stale_orders(self) -> int:
+        """The orders with a gig in the app that no driver has booked for STALE_AFTER minutes: the shortage, before any warning."""
+        stale = 0
+        for order_id, order in self.orders.items():
+            gigs = self.gigs_of(order_id)
+            if gigs and undelivered(order) and not any(g in self.booked for g in gigs) \
+                    and self.now - self.first_posted.get(order_id, self.now) > STALE_AFTER:
+                stale += 1
+        return stale
+
+    def at_risk_share(self) -> float:
+        """Late orders, orders past their deadline with a car undelivered, and half of the orders inside their deadline warning
+        with no driver, over the orders won. The delivery minimum is 90% on time, so this is the number to keep low."""
+        if not self.orders:
+            return 0.0
+        late = sum(1 for order_id in self.orders if order_id in self.late)
+        overdue = sum(1 for o in self.orders.values() if o["id"] not in self.late and o["deadline"] < self.now and undelivered(o))
+        waiting = sum(1 for order_id in self.urgent if order_id in self.orders and order_id not in self.late
+                      and undelivered(self.orders[order_id]) and not any(g in self.booked for g in self.gigs_of(order_id)))
+        return (late + overdue + 0.5 * waiting) / (len(self.orders) + 20)
+
+    def trust_boost(self, dealer: str) -> float:
+        """Level 8: a dealer accepts 1% more for each of your orders that it counted on time, up to 25."""
+        return 1 + TRUST_STEP * self.trust[dealer] if self.level >= 8 else 1.0
+
+    def trust_line(self, line: Any) -> None:
+        """Counts a dealer's on-time orders from the ledger, as RULES.md says: a revenue line with no late refund is an order
+        on time, and a late order halves the dealer's count."""
+        order_id = line["orderId"]
+        dealer = self.requests[order_id]["dealerId"] if order_id in self.requests else None
+        if dealer is None:
+            return
+        if line["kind"] == "revenue" and order_id not in self.refunded and order_id not in self.counted:
+            self.counted.add(order_id)
+            self.trust[dealer] = min(TRUST_MAX, self.trust[dealer] + 1)
+        elif line["kind"] == "late_refund" and order_id not in self.refunded:
+            self.refunded.add(order_id)
+            if order_id in self.counted:  # the revenue line came first: take its count back before halving
+                self.counted.discard(order_id)
+                self.trust[dealer] = max(0, self.trust[dealer] - 1)
+            self.trust[dealer] //= 2
 
     def learn_booking(self, gig_id: str, fee: int) -> None:
         """A gig that books at its first fee was posted too high, and one that needed a raise too low."""
@@ -291,31 +429,109 @@ class Desk:
             self.outbox.append({"type": "quote", "requestId": request["id"], "prices": prices})
 
     def prices_for(self, request: PriceRequest) -> dict[str, int]:
-        """A price for each option: the list price with the markup, never under the cost. {} declines: up to level 3, no quote;
-        from level 4, a price so high that it loses is also a decline, but the cost floor does that by itself."""
-        cost = self.cost_floor(request)
+        """A price for each option: the list price at the market level, with what trust and trouble add, never under the cost of
+        the option. {} declines: up to level 3, no quote; from level 4, a price so high that it loses is also a decline, and
+        so is the guard's."""
+        cost, scarcity, risk = self.assess(request)
         if self.level <= 3:  # no competitor: the first option at its list price always wins
             first = request["options"][0]
             return {first["kind"]: first["listPriceCents"]} if first["listPriceCents"] >= cost else {}
-        markup = self.markup()
-        return {o["kind"]: max(1, int(max(o["listPriceCents"] * markup * OPTION_FACTOR[o["kind"]], cost) + 0.5)) for o in request["options"]}
+        place = request["legs"][0]["pickup"]["placeId"]
+        market, trust, pressure = self.market.multiple(place, self.now), self.trust_boost(request["dealerId"]), self.pressure_factor()
+        declined = self.declined(request, scarcity, risk)
+        far = max(request["referenceFeeCents"], 100) * DECLINE_MULT
+        units: dict[str, float] = {}
+        prices: dict[str, int] = {}
+        for option in request["options"]:
+            kind, listed = option["kind"], max(1, option["listPriceCents"])
+            units[kind] = listed * market * OPTION_FACTOR[kind]
+            price = max(listed * DECLINE_MULT, far) if kind in declined else max(units[kind] * trust * pressure, cost * OPTION_COST[kind])
+            prices[kind] = max(1, int(price + 0.5))
+        self.drafts[request["id"]] = Quoted(place, trust, units, prices)
+        return prices
 
-    def cost_floor(self, request: PriceRequest) -> float:
+    def declined(self, request: PriceRequest, scarcity: float, risk: float) -> set[str]:
+        """The options to decline while the delivery minimum is in danger. Same-day work goes first, then the risky cars:
+        where drivers are few, or the note adds risk. A decline is a quote far above the list, and it costs nothing."""
+        share = self.at_risk_share()
+        if share < GUARD_SOFT:
+            return set()
+        risky = scarcity >= GUARD_SCARCITY or risk >= GUARD_RISK or (share >= GUARD_HARD and scarcity >= GUARD_SCARCITY_HARD)
+        return {o["kind"] for o in request["options"] if risky or o["kind"] == "same_day"}
+
+    def assess(self, request: PriceRequest) -> tuple[float, float, float]:
         """What moving the car will probably cost, with the margin: the typical fee, times what the level teaches about fees,
-        the scarcity of drivers where the car is, the size of its dealer group's bulk order, and the risk in its note."""
+        the scarcity of drivers where the car is, the size of its dealer group's bulk order against the drivers near its yard,
+        the risk in its note, and what drivers dislike (RULES.md: private addresses, evenings, Saturdays, charging, trade-ins;
+        the typical fee covers only the drive and the trips). Returns (cost, scarcity, note risk)."""
         first = request["legs"][0]
         premium = any(leg["car"]["premium"] for leg in request["legs"])
         scarcity = self.supply.scarcity(first["pickup"]["placeId"], first["delivery"]["placeId"], premium)
-        batch = self.batches[request["batchId"]] if request["batchId"] else 0
-        bulk = 1 + min(0.6, 0.02 * max(0, batch - 4))  # 30 to 40 cars from one yard: the later ones cost more
         risk = note_risk(read_note(request["note"], request["arrivedAt"]), request)
-        return max(0, request["referenceFeeCents"]) * EXPECTED_FEE[self.level] * self.fee_mult * scarcity * bulk * risk * MARGIN * self.ease
+        cost = (max(0, request["referenceFeeCents"]) * EXPECTED_FEE[self.level] * self.fee_mult * scarcity
+                * self.bulk_factor(request) * risk * self.extras(request) * MARGIN * self.ease)
+        return cost, scarcity, risk
+
+    def bulk_factor(self, request: PriceRequest) -> float:
+        """30 to 40 cars from one yard need 30 to 40 trips from it. The first cars cost no extra, as many as half the drivers
+        near the yard (4 to 12); each car after that adds BULK_SLOPE to the cost."""
+        batch_id = request["batchId"]
+        if not batch_id:
+            return 1.0
+        near = self.supply.near.get(request["legs"][0]["pickup"]["placeId"], 0)
+        free = min(BULK_FREE_MAX, max(BULK_FREE_MIN, BULK_SUPPLY_SHARE * near)) if self.supply.drivers else BULK_FREE_MIN
+        size = max(self.batch_wins[batch_id], 0.75 * self.batches[batch_id])
+        return 1 + min(BULK_CAP, BULK_SLOPE * max(0.0, size - free))
+
+    def extras(self, request: PriceRequest) -> float:
+        """A multiple for the work that drivers dislike. Per car: a private address at either end, a pickup in the evening or on
+        Saturday, a charging stop; once: a trade-in."""
+        legs = request["legs"]
+        extra = EXTRA_TRADE_IN if len(legs) == 2 else 0.0
+        for leg in legs:
+            pickup, delivery, car = leg["pickup"], leg["delivery"], leg["car"]
+            if pickup["privateAddress"] or delivery["privateAddress"]:
+                extra += EXTRA_PRIVATE / len(legs)
+            start = pickup["window"]["from"]
+            if start // DAY % 7 == 5:
+                extra += EXTRA_WEEKEND / len(legs)
+            elif start % DAY >= EVENING_FROM:
+                extra += EXTRA_EVENING / len(legs)
+            km = self.supply.distance_km(pickup["placeId"], delivery["placeId"])
+            if car["electric"] and car["chargePercent"] is not None and car["chargePercent"] < 30 and km is not None and km >= 180:
+                extra += EXTRA_CHARGING / len(legs)
+        return 1 + extra
+
+    def confirm(self, request_id: str) -> None:
+        """The world accepted the quote: from now on a decision of the dealer teaches the market."""
+        if request_id in self.drafts:
+            self.quoted[request_id] = self.drafts.pop(request_id)
+
+    def learn_outcome(self, request_id: str, won: bool, option: Optional[str]) -> None:
+        """A dealer decided. The market learns only from a quote that was priced at its level (not raised for trust, which
+        is known, but for trouble, load or cost): a loss at a price that was high on purpose says nothing about the level."""
+        quote = self.quoted.pop(request_id, None)
+        self.drafts.pop(request_id, None)
+        if quote is None or self.level < 4:
+            return
+        if won:
+            unit, price = quote.units.get(option or ""), quote.prices.get(option or "")
+            if not unit or not price:
+                return
+            ratio = price / (unit * quote.trust)
+        else:
+            ratio = min((quote.prices[k] / (quote.units[k] * quote.trust) for k in quote.prices if quote.units[k] > 0), default=math.inf)
+        if ratio <= LEARN_CLEAN:
+            self.market.learn(quote.place, self.now, won)
 
     # --- Orders and gigs ---
 
     def win(self, order: Order) -> None:
         if order["id"] in self.requests and order["id"] not in self.orders:  # rejoin can know it already
             self.took += 1
+            if self.requests[order["id"]]["batchId"]:
+                self.batch_wins[self.requests[order["id"]]["batchId"]] += 1
+            self.learn_outcome(order["id"], True, order["option"])
             self.orders[order["id"]] = order
             self.post(order, undelivered(order))
 
@@ -338,7 +554,7 @@ class Desk:
             return
         # One of its windows has ended, perhaps at a site's closing time before the window's own end: post without its own stop windows.
         stops = without_windows(action["stops"], float("inf"))
-        self.outbox.append({**action, "stops": stops, "schedule": self.fees_for(order, pickups(action), self.current_fee(gig_id))})
+        self.outbox.append({**action, "stops": stops, "schedule": self.fees_for(order, pickups(action), self.current_fee(gig_id), legs_of(action))})
 
     def revive(self, gig_id: str) -> None:
         """After a drop or a no-show the gig is open again on its old schedule. A driver who gave it back takes it again only
@@ -351,7 +567,7 @@ class Desk:
             self.reprice(order, gig_id, action)
 
     def reprice(self, order: Order, gig_id: str, action: PostAction) -> None:
-        schedule = self.fees_for(order, pickups(action), self.current_fee(gig_id) * 1.05)
+        schedule = self.fees_for(order, pickups(action), self.current_fee(gig_id) * 1.05, legs_of(action))
         self.schedules[gig_id] = schedule
         self.outbox.append({"type": "reprice", "gigId": gig_id, "schedule": schedule})
 
@@ -398,16 +614,27 @@ class Desk:
         started = [step["feeCents"] for step in self.schedules.get(gig_id, []) if step["at"] <= self.now]
         return float(started[-1]) if started else 0.0
 
-    def fees_for(self, order: Order, cars: int, floor: float = 0.0) -> list[FeeStep]:
+    def fee_scarcity(self, order: Order, legs: Optional[list[int]]) -> float:
+        """Drivers are few around some pickups, and "a car far from any driver needs a fee that pays for the whole trip": the
+        fees start higher there, by FEE_SCARCITY of the scarcity premium that the quote already carries."""
+        chosen = [order["legs"][leg] for leg in (legs or [0])]
+        first = chosen[0]
+        scarcity = self.supply.scarcity(first["pickup"]["placeId"], first["delivery"]["placeId"], any(leg["car"]["premium"] for leg in chosen))
+        return 1 + FEE_SCARCITY * (scarcity - 1)
+
+    def fees_for(self, order: Order, cars: int, floor: float = 0.0, legs: Optional[list[int]] = None) -> list[FeeStep]:
         """The fees for some of the order's cars from now: rising, or steep once its deadline warning has come or is due.
-        They start at the typical fee, scaled by what bookings have taught, and no step is under `floor`. They stop short of
-        1.5 times the cars' share of the price, unless the first fee is higher already."""
+        They start at the typical fee, scaled by what bookings have taught and by the scarcity of drivers at the pickup, and
+        no step is under `floor`. They stop short of 1.5 times the cars' share of the price, unless the first fee is higher
+        already. The cap is higher inside the warning (a late car costs a refund) and higher again once the order is late
+        (a car undelivered at the end costs twice its price)."""
         share = cars / len(order["legs"])
-        fee = self.requests[order["id"]]["referenceFeeCents"] * share * self.fee_mult
+        fee = self.requests[order["id"]]["referenceFeeCents"] * share * self.fee_mult * self.fee_scarcity(order, legs)
         urgent = order["id"] in self.urgent or order["lastPickupAt"] - self.now <= URGENT_LEAD
         steps = steep(self.now, fee, self.level) if urgent else rising(self.now, fee, self.level)
         steps = [{"at": s["at"], "feeCents": max(s["feeCents"], int(floor + 0.5))} for s in steps]  # a floor keeps the fees from falling
-        cap = max(steps[0]["feeCents"], int(order["priceCents"] * share * FEE_CAP_SHARE))
+        cap_share = CAP_LATE if order["deadline"] < self.now else CAP_URGENT if urgent else FEE_CAP_SHARE
+        cap = max(steps[0]["feeCents"], int(order["priceCents"] * share * cap_share))
         return [{"at": s["at"], "feeCents": min(s["feeCents"], cap)} for s in steps]
 
     def retry(self, order_id: str, leg: int, reason: str) -> None:
@@ -425,7 +652,7 @@ class Desk:
         # A premium car needs an experienced driver: the fine is €150 a car.
         audience: Audience = {"experienced": any(leg["car"]["premium"] for leg in order["legs"]), "manualLicence": retry.manual_licence}
         stops = without_windows(stops_for(order, legs, request["note"], request["arrivedAt"], retry, self.supply), self.now)
-        self.outbox.append({"type": "post", "stops": stops, "audience": audience, "schedule": self.fees_for(order, len(legs))})
+        self.outbox.append({"type": "post", "stops": stops, "audience": audience, "schedule": self.fees_for(order, len(legs), legs=legs)})
         if len(legs) == 1:
             return
         # A trade-in over the 12-hour limit for a gig with two cars goes as one gig per car.
@@ -442,6 +669,7 @@ class Desk:
         """Remembers a gig that the world accepted: the post that made it, and the legs it carries."""
         for stop in action["stops"]:
             self.leg_gigs.setdefault(stop["orderId"], {})[stop["leg"]] = gig_id
+            self.first_posted.setdefault(stop["orderId"], self.now)
         self.posts[gig_id] = action
         self.schedules[gig_id] = action["schedule"]
 
@@ -467,10 +695,14 @@ class Desk:
             self.read_results(actions, self.world.act(actions))
 
     def read_results(self, actions: list[Action], results: list[ActionResult]) -> None:
-        """Remembers the gig of each post that the world accepted."""
+        """Remembers the gig of each post that the world accepted, and the quotes that it took."""
         for action, result in zip(actions, results):
-            if action["type"] == "post" and result["ok"] is True:
+            if result["ok"] is not True:
+                continue
+            if action["type"] == "post":
                 self.carry(action, result["id"])
+            elif action["type"] == "quote":
+                self.confirm(action["requestId"])
 
 
 def retry_from(order: Order, request: PriceRequest, leg: int, now: int) -> int:
@@ -489,6 +721,11 @@ def undelivered(order: Order) -> list[int]:
 def pickups(action: PostAction) -> int:
     """The cars a post carries."""
     return sum(1 for stop in action["stops"] if stop["kind"] == "pickup")
+
+
+def legs_of(action: PostAction) -> list[int]:
+    """The legs a post carries, in order."""
+    return [stop["leg"] for stop in action["stops"] if stop["kind"] == "pickup"]
 
 
 def without_windows(stops: list[StopRef], before: float) -> list[StopRef]:
