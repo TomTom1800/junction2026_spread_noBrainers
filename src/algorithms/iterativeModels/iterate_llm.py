@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+import difflib
 import importlib.util
 import json
 import os
@@ -25,11 +26,13 @@ from typing import Any, Optional
 
 
 ROOT = Path(__file__).resolve().parents[3]
-DISPATCH = ROOT / "src" / "algorithms" / "dispatch_upgraded.py"
+DISPATCH = ROOT / "src" / "algorithms" / "best_model.py"
 DISPATCH_NAME = DISPATCH.name
 DISPATCH_RELATIVE = DISPATCH.relative_to(ROOT).as_posix()
 RULES = ROOT / "docs" / "RULES.md"
-SCORE_RE = re.compile(r"End\s+margin €\s*([\d,.-]+)\s+revenue €\s*[\d,.-]+\s+\d+ orders\s+(\d+(?:\.\d+)?)% on time")
+SCORE_RE = re.compile(
+    r"End\s+margin €\s*([\d,.-]+)\s+revenue €\s*([\d,.-]+)\s+\d+ orders\s+(\d+(?:\.\d+)?)% on time"
+)
 WORLD_ID_RE = re.compile(r"(?:Practice world|Ranking run)\s+([A-Za-z0-9_-]+)")
 TRANSIENT_ERROR_RE = re.compile(
     r"(?:timeout|timed out|temporarily unavailable|connection reset|connection "
@@ -55,6 +58,51 @@ def wait_before_retry(operation: str, attempt: int, retry_delay: float) -> None:
         flush=True,
     )
     time.sleep(delay)
+
+
+def changed_rows(before: str, after: str) -> tuple[int, int]:
+    """Count added and removed source lines, excluding unified-diff headers."""
+    diff = difflib.unified_diff(before.splitlines(), after.splitlines(), lineterm="")
+    added = removed = 0
+    for line in diff:
+        if line.startswith("+++") or line.startswith("---") or line.startswith("@@"):
+            continue
+        if line.startswith("+"):
+            added += 1
+        elif line.startswith("-"):
+            removed += 1
+    return added, removed
+
+
+def print_run_summary(label: str, score: tuple[int, int, float], runs: list[dict[str, Any]]) -> None:
+    total_profit = sum(run["margin_cents"] for run in runs)
+    total_revenue = sum(run["revenue_cents"] for run in runs)
+    margin_rate = total_profit / total_revenue if total_revenue else 0.0
+    average_on_time = sum(run["on_time"] for run in runs) / len(runs) if runs else 0.0
+    print(f"{label} — {score[0]}/{len(runs)} ranked", flush=True)
+    for run in runs:
+        seed_margin = run["margin_share"]
+        print(
+            f"  {run['seed']}: net profit €{run['margin_cents'] / 100:,.2f} | "
+            f"margin rate {seed_margin:.1%} | on-time deliveries {run['on_time']:.1%} | "
+            f"{'ranked' if run['ranked'] else 'not ranked'}",
+            flush=True,
+        )
+    print(
+        f"  Total: net profit €{total_profit / 100:,.2f} | margin rate {margin_rate:.1%} | "
+        f"average on-time deliveries {average_on_time:.1%}",
+        flush=True,
+    )
+
+
+def print_seed_result(label: str, seed: str, margin_cents: int, revenue_cents: int, on_time: float, ranked: bool) -> None:
+    margin_rate = margin_cents / revenue_cents if revenue_cents else 0.0
+    print(
+        f"{label} seed {seed}: net profit €{margin_cents / 100:,.2f} | "
+        f"margin rate {margin_rate:.1%} | on-time deliveries {on_time:.1%} | "
+        f"{'ranked' if ranked else 'not ranked'}",
+        flush=True,
+    )
 
 
 def collect_diagnostics(world_id: str, server_retries: int, retry_delay: float) -> dict[str, Any]:
@@ -186,6 +234,9 @@ CURRENT {DISPATCH_RELATIVE}:
 {source}
 ```
 """
+    print("\n========== PROMPT SENT TO CODEX: START ==========\n", flush=True)
+    print(prompt, flush=True)
+    print("\n========== PROMPT SENT TO CODEX: END ==========\n", flush=True)
     codex = shutil.which("codex")
     if not codex:
         raise RuntimeError("Codex CLI was not found on PATH. Install it and sign in with `codex login`.")
@@ -264,6 +315,7 @@ def evaluate(
     server_retries: int,
     retry_delay: float,
     evaluation_timeout: float,
+    label: str,
 ) -> tuple[tuple[int, int, float], list[dict[str, Any]]]:
     runs: list[dict[str, Any]] = []
     with tempfile.TemporaryDirectory(prefix="spread-eval-") as temp:
@@ -295,6 +347,10 @@ def evaluate(
             ranked = "Ranked." in result.stdout
             if result.returncode or not match or not world_match:
                 raise RuntimeError(f"Evaluation failed for seed {seed!r}:\n{result.stderr}\n{result.stdout[-3000:]}")
+            margin_cents = round(float(match.group(1).replace(",", "")) * 100)
+            revenue_cents = round(float(match.group(2).replace(",", "")) * 100)
+            on_time = float(match.group(3)) / 100
+            print_seed_result(label, seed, margin_cents, revenue_cents, on_time, ranked)
             try:
                 diagnostics = collect_diagnostics(world_match.group(1), server_retries, retry_delay)
             except Exception as error:
@@ -309,8 +365,9 @@ def evaluate(
                     "worldId": world_match.group(1),
                     "error": f"{type(error).__name__}: {error}",
                 }
-            runs.append({"seed": seed, "margin_cents": round(float(match.group(1).replace(",", "")) * 100),
-                         "on_time": float(match.group(2)) / 100, "ranked": ranked,
+            runs.append({"seed": seed, "margin_cents": margin_cents, "revenue_cents": revenue_cents,
+                         "margin_share": margin_cents / revenue_cents if revenue_cents else 0.0,
+                         "on_time": on_time, "ranked": ranked,
                          "diagnostics": diagnostics})
     score = (sum(run["ranked"] for run in runs), sum(run["margin_cents"] for run in runs),
              sum(run["on_time"] for run in runs) / len(runs))
@@ -324,7 +381,7 @@ def main() -> int:
     parser.add_argument("--seed", action="append", dest="seeds", help="training seed; repeat to set the optimization seed set")
     parser.add_argument("--holdout-seed", action="append", dest="holdout_seeds", help="separate validation seed; repeat to set holdout worlds")
     parser.add_argument("--no-holdout", action="store_true", help="skip independent validation worlds")
-    parser.add_argument("--level", type=int, choices=range(1, 9), default=8)
+    parser.add_argument("--level", type=int, choices=range(1, 9), default=3)
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--patch-retries", type=int, default=2, help="re-ask Codex after a no-op or unusable patch (default: 2 retries)")
     parser.add_argument("--server-retries", type=int, default=3, help="retries for transient server failures (default: 3)")
@@ -357,14 +414,21 @@ def main() -> int:
     if overlap:
         parser.error(f"Training and holdout seeds must be separate; overlap: {', '.join(sorted(overlap))}")
 
-    best_source = DISPATCH.read_text(encoding="utf-8")
-    best_score, best_runs = evaluate(best_source, seeds, args.level, args.server_retries, args.retry_delay, args.evaluation_timeout)
-    best_holdout_score, _ = evaluate(best_source, holdout_seeds, args.level, args.server_retries, args.retry_delay, args.evaluation_timeout) if holdout_seeds else (None, [])
-    compact = lambda runs: [{"seed": run["seed"], "margin_cents": run["margin_cents"],
-                             "on_time": run["on_time"], "ranked": run["ranked"]} for run in runs]
-    print(f"Initial training score {best_score}; runs: {json.dumps(compact(best_runs))}", flush=True)
+    initial_source = DISPATCH.read_text(encoding="utf-8")
+    best_source = initial_source
+    best_score, best_runs = evaluate(
+        best_source, seeds, args.level, args.server_retries, args.retry_delay, args.evaluation_timeout, "Baseline"
+    )
     if holdout_seeds:
-        print(f"Initial holdout score {best_holdout_score} on {len(holdout_seeds)} separate seeds.", flush=True)
+        best_holdout_score, baseline_holdout_runs = evaluate(
+            best_source, holdout_seeds, args.level, args.server_retries, args.retry_delay,
+            args.evaluation_timeout, "Baseline holdout",
+        )
+    else:
+        best_holdout_score, baseline_holdout_runs = None, []
+    print_run_summary("Baseline training results", best_score, best_runs)
+    if holdout_seeds:
+        print_run_summary("Baseline holdout results", best_holdout_score, baseline_holdout_runs)
     history = [f"Baseline training score {best_score}; detailed diagnostics: {json.dumps(best_runs, ensure_ascii=False)}"]
     fatal_codex_error = False
     for iteration in range(1, args.iterations + 1):
@@ -390,34 +454,62 @@ def main() -> int:
                     break
                 continue
 
-            score, runs = evaluate(candidate, seeds, args.level, args.server_retries, args.retry_delay, args.evaluation_timeout)
-            print(f"Candidate training score {score}; runs: {json.dumps(compact(runs))}", flush=True)
+            score, runs = evaluate(
+                candidate, seeds, args.level, args.server_retries, args.retry_delay,
+                args.evaluation_timeout, f"Candidate {iteration}",
+            )
+            added, removed = changed_rows(best_source, candidate)
+            print_run_summary(f"Candidate training results (iteration {iteration})", score, runs)
             if score <= best_score:
                 feedback = f"The valid patch scored {score}, which did not beat the current training score {best_score}. Try a different evidence-based change."
+                print(
+                    f"File changed: No (candidate rejected). Candidate code delta: +{added}/-{removed} rows; saved delta: +0/-0.",
+                    flush=True,
+                )
                 history.append(f"Iteration {iteration}: rejected training candidate {score}; diagnostics: {json.dumps(runs, ensure_ascii=False)}")
                 break
 
-            holdout_score, holdout_runs = evaluate(candidate, holdout_seeds, args.level, args.server_retries, args.retry_delay, args.evaluation_timeout) if holdout_seeds else (None, [])
+            if holdout_seeds:
+                holdout_score, holdout_runs = evaluate(
+                    candidate, holdout_seeds, args.level, args.server_retries, args.retry_delay,
+                    args.evaluation_timeout, f"Candidate {iteration} holdout",
+                )
+            else:
+                holdout_score, holdout_runs = None, []
             holdout_ok = not holdout_seeds or holdout_score >= best_holdout_score
             if holdout_seeds:
-                print(f"Candidate holdout score {holdout_score} (current best {best_holdout_score}); "
-                      f"{'passed' if holdout_ok else 'regressed'}.", flush=True)
+                print_run_summary(f"Candidate holdout results (iteration {iteration})", holdout_score, holdout_runs)
+                print(f"Holdout check: {'passed' if holdout_ok else 'regressed'}.", flush=True)
             if holdout_ok:
                 best_source, best_score, best_runs = candidate, score, runs
                 if holdout_seeds:
                     best_holdout_score = holdout_score
                 DISPATCH.write_text(best_source, encoding="utf-8")
-                print(f"Accepted and saved to {DISPATCH}.", flush=True)
+                print(
+                    f"File changed: Yes; saved to {DISPATCH}. Code delta: +{added}/-{removed} rows.",
+                    flush=True,
+                )
                 holdout_note = "passed; score details withheld from Codex" if holdout_seeds else "disabled"
                 history.append(f"Iteration {iteration}: accepted training score {score}; diagnostics: {json.dumps(runs, ensure_ascii=False)}; holdout={holdout_note}")
             else:
                 feedback = "The patch improved training but regressed on the separate holdout seeds. Try a more general change."
+                print(
+                    f"File changed: No (holdout regressed). Candidate code delta: +{added}/-{removed} rows; saved delta: +0/-0.",
+                    flush=True,
+                )
                 history.append(f"Iteration {iteration}: rejected by holdout; training score {score}; holdout details withheld; training diagnostics: {json.dumps(runs, ensure_ascii=False)}")
             break
         if fatal_codex_error:
             break
-    print(f"Finished. Best training score {best_score}; runs: {json.dumps(compact(best_runs))}; "
-          f"best holdout score: {best_holdout_score}", flush=True)
+    final_added, final_removed = changed_rows(initial_source, best_source)
+    print_run_summary("Final best training results", best_score, best_runs)
+    if holdout_seeds:
+        print(f"Final best holdout score: {best_holdout_score}.", flush=True)
+    print(
+        f"File changed during this run: {'Yes' if best_source != initial_source else 'No'}. "
+        f"Net code delta: +{final_added}/-{final_removed} rows in {DISPATCH}.",
+        flush=True,
+    )
     return 0
 
 
